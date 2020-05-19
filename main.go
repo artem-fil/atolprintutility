@@ -18,9 +18,10 @@ import (
 	"github.com/sacOO7/gowebsocket"
 )
 
-var addr = flag.String("addr", "localhost", "http service address")
+var addr = flag.String("addr", "test.pawnshop.tatrix.org", "http service address")
 var atolServerURL = "http://localhost:16732/requests"
-var logPath = "log.txt"
+var logPath = "C:/Program Files/pawnshop/log.txt"
+var office = os.Getenv("OFFICE")
 var getRequestDelay = time.Duration(3)
 var getRequestAttempts = 6
 var logger service.Logger
@@ -52,6 +53,10 @@ type shiftStatus struct {
 	Number      int
 	State       string
 }
+type incomingMessage struct {
+	Type string          `json:"type"`
+	Body json.RawMessage `json:"body"`
+}
 
 func (p *program) Start(s service.Service) error {
 	go p.run()
@@ -80,76 +85,93 @@ func (p *program) run() {
 	}
 
 	socket.OnTextMessage = func(message string, socket gowebsocket.Socket) {
-
-		writeToLog("self: ", " ======= New task ======== ")
-		// checking Shift status, close and open if required
-		writeToLog("self: ", "1. Checking Shift status... ")
-		err := handleShiftStatus()
+		writeToLog("self: ", " ******* Incoming message... ******* ")
+		// first we need to parse message and deal with its type
+		var parsedMessage incomingMessage
+		err := json.Unmarshal([]byte(message), &parsedMessage)
 		if err != nil {
-			errorHandle(socket, "self: ", "Error while handling Shift status: ", err.Error())
+			errorHandle(socket, "self: ", "Error while incoming message unmarshaling: ", err.Error())
 			return
 		}
-		writeToLog("self: ", "2. Sending JSON task... ")
-		// sending POST req with JSON task
-		newUUID, err := uuid.NewUUID()
-		if err != nil {
-			errorHandle(socket, "self: ", "Error while uuid generation: ", err.Error())
-			return
-		}
-		var r interface{}
-		err = json.Unmarshal([]byte(message), &r)
-		if err != nil {
-			errorHandle(socket, "self: ", "Error while task unmarshaling: ", err.Error())
-			return
-		}
-		writeToLog("self: ", "Incoming JSON: ", message)
-
-		postResp, err := postRequest(newUUID.String(), r)
-		if err != nil {
-			errorHandle(socket, "atol-webserver: ", "Error while sending POST: ", err.Error())
-			return
-		}
-		defer postResp.Body.Close()
-		writeToLog("atol-webserver: ", "POST response status: ", postResp.Status)
-
-		if postResp.StatusCode == http.StatusCreated {
-			writeToLog("self: ", "3. GETting result... ")
-			//here we need to loop this several times until task isnt finished
-
-			for i := 0; i < getRequestAttempts; i++ {
-				getResp, err := http.Get(fmt.Sprintf("%s/%s", atolServerURL, newUUID.String()))
-				if err != nil {
-					writeToLog("atol-webserver: ", "Error while sending GET: ", err)
-				}
-
-				defer getResp.Body.Close()
-				if getResp.StatusCode == http.StatusOK {
-
-					getRespBody, _ := ioutil.ReadAll(getResp.Body)
-					writeToLog("atol-webserver: ", "GET response Body:", string(getRespBody))
-
-					var getRespBodyStruct getRespType
-					err = json.Unmarshal(getRespBody, &getRespBodyStruct)
-					if err != nil {
-						writeToLog("self: ", "Error while GET response JSON unmarshaling: ", err)
-					}
-					result := getRespBodyStruct.Results[0]
-
-					if result.Status == "ready" {
-						writeToLog("atol-webserver: ", "Everything seems to be OK")
-						break
-					} else {
-						writeToLog("atol-webserver: ", "Task wasn't printed. Status: ", result.Status, ". Error code: ", result.ErrorCode, ". Error description: ", result.ErrorDescription)
-					}
-				} else {
-					writeToLog("atol-webserver: ", "Failed GET request: ", getResp.Status)
-				}
-				time.Sleep(getRequestDelay * time.Second)
+		switch parsedMessage.Type {
+		case "auth":
+			writeToLog("self: ", " ======= UUID assign ======== ")
+			// we need to send back "office" variable to bind it with id and thus be able
+			// to send tasks to particular machine
+			writeToLog("self: ", "OFFICE: ", office)
+			authJSON, _ := json.Marshal(map[string]string{"type": "auth", "message": office})
+			socket.SendText(string(authJSON))
+			writeToLog("self: ", " ======= Auth completed ======== ")
+		case "task":
+			writeToLog("self: ", " ======= New task ======= ")
+			// checking Shift status, close and open if required
+			writeToLog("self: ", "1. Checking Shift status... ")
+			err = handleShiftStatus()
+			if err != nil {
+				errorHandle(socket, "self: ", "Error while handling Shift status: ", err.Error())
+				return
 			}
-		} else {
-			errorHandle(socket, "atol-webserver: ", "Failed POST request", "Task from POST request wasn't added to queue")
+			writeToLog("self: ", "2. Sending JSON task... ")
+			// sending POST req with JSON task
+			newUUID, err := uuid.NewUUID()
+			if err != nil {
+				errorHandle(socket, "self: ", "Error while uuid generation: ", err.Error())
+				return
+			}
+
+			postResp, err := postRequest(newUUID.String(), parsedMessage.Body)
+			if err != nil {
+				errorHandle(socket, "atol-webserver: ", "Error while sending POST: ", err.Error())
+				return
+			}
+			defer postResp.Body.Close()
+			writeToLog("atol-webserver: ", "POST response status: ", postResp.Status)
+
+			if postResp.StatusCode == http.StatusCreated {
+				writeToLog("self: ", "3. GETting result... ")
+				//here we need to loop this several times until task isnt finished
+
+				for i := 0; i < getRequestAttempts; i++ {
+					getResp, err := http.Get(fmt.Sprintf("%s/%s", atolServerURL, newUUID.String()))
+					if err != nil {
+						writeToLog("atol-webserver: ", "Error while sending GET: ", err)
+					}
+
+					defer getResp.Body.Close()
+					if getResp.StatusCode == http.StatusOK {
+
+						getRespBody, _ := ioutil.ReadAll(getResp.Body)
+						writeToLog("atol-webserver: ", "GET response Body:", string(getRespBody))
+
+						var getRespBodyStruct getRespType
+						err = json.Unmarshal(getRespBody, &getRespBodyStruct)
+						if err != nil {
+							writeToLog("self: ", "Error while GET response JSON unmarshaling: ", err)
+						}
+						result := getRespBodyStruct.Results[0]
+
+						if result.Status == "ready" {
+							writeToLog("atol-webserver: ", "Everything seems to be OK")
+							successJSON, _ := json.Marshal(map[string]string{"type": "success", "message": "We've reached 'ready' status"})
+							socket.SendText(string(successJSON))
+							break
+						} else {
+							writeToLog("atol-webserver: ", "Task wasn't printed. Status: ", result.Status, ". Error code: ", result.ErrorCode, ". Error description: ", result.ErrorDescription)
+						}
+					} else {
+						writeToLog("atol-webserver: ", "Failed GET request: ", getResp.Status)
+					}
+					time.Sleep(getRequestDelay * time.Second)
+				}
+			} else {
+				errorHandle(socket, "atol-webserver: ", "Failed POST request", "Task from POST request wasn't added to queue")
+			}
+			writeToLog("self: ", " ======= Task finished ======== ")
+
+		default:
+			writeToLog("self: ", "Unknown message type")
 		}
-		writeToLog("self: ", " ======= Task finished ======== ")
+
 	}
 
 	socket.OnPingReceived = func(data string, socket gowebsocket.Socket) {

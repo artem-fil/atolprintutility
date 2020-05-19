@@ -1,78 +1,87 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
+	"strconv"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
+	"math"
 	"net/url"
 	"os"
 	"os/signal"
 	"time"
 
-	"github.com/google/uuid"
+	fptr10 "atol.ru/drivers10/fptr"
 	"github.com/kardianos/service"
 	"github.com/sacOO7/gowebsocket"
 )
-
-var addr = flag.String("addr", "test.pawnshop.tatrix.org", "http service address")
-var atolServerURL = "http://localhost:16732/requests"
+const CONNECTION_ATTEMPTS = 5;
+var addr = flag.String("addr", "online.autolombard-petersburg.ru", "http service address")
 var logPath = "C:/Program Files/pawnshop/log.txt"
 var office = os.Getenv("OFFICE")
-var getRequestDelay = time.Duration(3)
-var getRequestAttempts = 6
 var logger service.Logger
 
 type program struct{}
-type getRespType struct {
-	Results []result
-}
-type result struct {
-	Status           string
-	ErrorCode        int
-	ErrorDescription string
-	Result           interface{}
-}
-type getShiftRespType struct {
-	Results []shiftResult
-}
-type shiftResult struct {
-	Status           string
-	ErrorCode        int
-	ErrorDescription string
-	Result           shift
-}
-type shift struct {
-	ShiftStatus shiftStatus
-}
-type shiftStatus struct {
-	ExpiredTime string
-	Number      int
-	State       string
-}
+
+type Side string
+
+const (
+	Credit Side = "debit"
+	Debit  Side = "credit"
+)
+
 type incomingMessage struct {
-	Type string          `json:"type"`
-	Body json.RawMessage `json:"body"`
+	Type      string  `json:"type"`
+	Device    string  `json:"device"`
+	IncomeSum float64 `json:"sum"`
+	Body      struct {
+		Operator string
+		Side     Side
+		Product  struct {
+			Name     string
+			Price    int32
+			Quantity int8
+		}
+		Payments []struct {
+			Type string
+			Sum  int32
+		}
+	} `json:"body"`
 }
+
+const PAWNSHOP_SERIAL = "00106101867206"
+const LEASING_SERIAL = "00106101867521"
 
 func (p *program) Start(s service.Service) error {
 	go p.run()
 	return nil
 }
+
+func (p *program) Stop(s service.Service) error {
+	return nil
+}
+
 func (p *program) run() {
+
 	flag.Parse()
 	log.SetFlags(0)
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
+	// Define ports
+	pawnshopPort, leasingPort := definePorts();
+	writeToLog("self: ", "Ports: ", pawnshopPort, leasingPort)
+	// Establish websocket server connection
+
 	u := url.URL{Scheme: "wss", Host: *addr, Path: "/websocket"}
 	writeToLog("self: ", "Connecting to ", u.String())
 	var connected = false
 	socket := gowebsocket.New(u.String())
+
+	// Define websocket methods
 
 	socket.OnConnected = func(socket gowebsocket.Socket) {
 		connected = true
@@ -84,104 +93,306 @@ func (p *program) run() {
 		writeToLog("wsserver: ", "Error while connecting: ", err)
 	}
 
+	socket.OnPingReceived = func(data string, socket gowebsocket.Socket) {
+		socket.SendText("heartbeat")
+	}
+
+	socket.OnDisconnected = func(err error, socket gowebsocket.Socket) {
+		writeToLog("wsserver: ", "Disconnected from server. Retry connection")
+		connected = false
+		for !connected {
+			socket.Connect()
+			time.Sleep(time.Second)
+		}
+		return
+	}
+
 	socket.OnTextMessage = func(message string, socket gowebsocket.Socket) {
 		writeToLog("self: ", " ******* Incoming message... ******* ")
 		// first we need to parse message and deal with its type
 		var parsedMessage incomingMessage
 		err := json.Unmarshal([]byte(message), &parsedMessage)
 		if err != nil {
-			errorHandle(socket, "self: ", "Error while incoming message unmarshaling: ", err.Error())
+			writeToLog("self: ", "Incoming JSON: ", message)
+			errorHandle(socket, "self: ", "Error while incoming message unmarshalling: ", err.Error())
 			return
 		}
 		switch parsedMessage.Type {
 		case "auth":
-			writeToLog("self: ", " ======= UUID assign ======== ")
+			writeToLog("self: ", " ======= Auth starting ======== ")
 			// we need to send back "office" variable to bind it with id and thus be able
 			// to send tasks to particular machine
 			writeToLog("self: ", "OFFICE: ", office)
 			authJSON, _ := json.Marshal(map[string]string{"type": "auth", "message": office})
 			socket.SendText(string(authJSON))
 			writeToLog("self: ", " ======= Auth completed ======== ")
+		case "status":
+			writeToLog("self: ", " ======= Status request ======== ")
+
+			leasingDevice, leasingErr := connectDevice(leasingPort)
+			pawnshopDevice, pawnshopErr := connectDevice(pawnshopPort)
+
+			var pawnshopBalance, leasingBalance float64 = 0, 0
+
+			if leasingErr == nil {
+				leasingDevice.SetParam(fptr10.LIBFPTR_PARAM_DATA_TYPE, fptr10.LIBFPTR_DT_CASH_SUM)
+				leasingDevice.QueryData()
+
+				leasingBalance = leasingDevice.GetParamDouble(fptr10.LIBFPTR_PARAM_SUM)
+			}
+
+			if pawnshopErr == nil {
+				pawnshopDevice.SetParam(fptr10.LIBFPTR_PARAM_DATA_TYPE, fptr10.LIBFPTR_DT_CASH_SUM)
+				pawnshopDevice.QueryData()
+
+				pawnshopBalance = pawnshopDevice.GetParamDouble(fptr10.LIBFPTR_PARAM_SUM)
+			}
+
+			type Message struct {
+				Pawnshop        bool    `json:"pawnshop"`
+				PawnshopBalance float64 `json:"pawnshopBalance"`
+				Leasing         bool    `json:"leasing"`
+				LeasingBalance  float64 `json:"leasingBalance"`
+			}
+			type Status struct {
+				Type    string  `json:"type"`
+				Message Message `json:"message"`
+			}
+			statusJSON, _ := json.Marshal(Status{
+				Type: "status", 
+				Message: Message {
+					Pawnshop: pawnshopErr == nil,
+					PawnshopBalance: pawnshopBalance,
+					Leasing: leasingErr == nil,
+					LeasingBalance: leasingBalance,
+				},
+			});
+			socket.SendText(string(statusJSON))
+			if err := leasingDevice.Close(); err != nil {
+				writeToLog("self: ", "Error while leasing device closing: ", err.Error())
+			}
+			if err := pawnshopDevice.Close(); err != nil {
+				writeToLog("self: ", "Error while pawnshop device closing: ", err.Error())
+			}
+			writeToLog("self: ", " ======= Status provided ======== ")
+		case "income":
+			writeToLog("self: ", " ======= Cash income request ======== ")
+
+			var port string
+			switch parsedMessage.Device {
+			case "pawnshop":
+				port = pawnshopPort
+			case "leasing":
+				port = leasingPort
+			default:
+				errorHandle(socket, "self: ", "Error while device defining: ", "device wasn't provided in the task")
+				return
+			}
+			writeToLog("self: ", "Port: ", port)
+			device, err := connectDevice(port)
+			if err != nil {
+				errorHandle(socket, "self: ", "Error while device connecting: ", err.Error())
+				return
+			}
+
+			// checking Shift state, close if expired
+
+			writeToLog("self: ", "1. Checking shift state ")
+
+			device.SetParam(fptr10.LIBFPTR_PARAM_DATA_TYPE, fptr10.LIBFPTR_DT_SHIFT_STATE)
+			device.QueryData()
+
+			shiftState := device.GetParamInt(fptr10.LIBFPTR_PARAM_SHIFT_STATE)
+
+			if shiftState == fptr10.LIBFPTR_SS_EXPIRED {
+				writeToLog("self: ", "1.1 Closing expired Shift")
+				device.SetParam(fptr10.LIBFPTR_PARAM_REPORT_TYPE, fptr10.LIBFPTR_RT_CLOSE_SHIFT)
+
+				if err = device.Report(); err != nil {
+					errorHandle(socket, "self: ", "Error while shift closing: ", err.Error())
+					device.Close()
+					return
+				}
+
+				if err = device.CheckDocumentClosed(); err != nil {
+					errorHandle(socket, "self: ", "Error while document closing check: ", err.Error())
+					device.Close()
+					return
+				}
+			}
+
+			writeToLog("self: ", "2. Applying income ")
+
+			device.SetParam(fptr10.LIBFPTR_PARAM_SUM, parsedMessage.IncomeSum)
+			if err := device.CashIncome(); err != nil {
+				writeToLog("self: ", "Error while cash income method applying: ", err.Error())
+			}
+
+			if err := device.Close(); err != nil {
+				writeToLog("self: ", "Error while device connection closing: ", err.Error())
+			}
+
+			successJSON, _ := json.Marshal(map[string]string{"type": "success", "message": "Everything seems to be OK"})
+			socket.SendText(string(successJSON))
+			
+			writeToLog("self: ", " ======= Cash incomed ======== ")
 		case "task":
 			writeToLog("self: ", " ======= New task ======= ")
-			// checking Shift status, close and open if required
-			writeToLog("self: ", "1. Checking Shift status... ")
-			err = handleShiftStatus()
-			if err != nil {
-				errorHandle(socket, "self: ", "Error while handling Shift status: ", err.Error())
+			// define what device we should looking for and establish its connection
+			var port string
+			// TODO: how to get rid of hardcoded port numbers
+			switch parsedMessage.Device {
+			case "pawnshop":
+				port = pawnshopPort
+			case "leasing":
+				port = leasingPort
+			default:
+				errorHandle(socket, "self: ", "Error while device defining: ", "device wasn't provided in the task")
 				return
 			}
-			writeToLog("self: ", "2. Sending JSON task... ")
-			// sending POST req with JSON task
-			newUUID, err := uuid.NewUUID()
+			writeToLog("self: ", "Port: ", port)
+			device, err := connectDevice(port)
 			if err != nil {
-				errorHandle(socket, "self: ", "Error while uuid generation: ", err.Error())
+				errorHandle(socket, "self: ", "Error while device connecting: ", err.Error())
+				return
+			}
+			var task = parsedMessage.Body
+			var product = task.Product
+			var payments = task.Payments
+			// Log in operator
+			device.SetParam(1021, task.Operator);
+
+			if err = device.OperatorLogin(); err != nil {
+				errorHandle(socket, "self: ", "Error while operator login: ", err.Error());
+				device.Close();
 				return
 			}
 
-			postResp, err := postRequest(newUUID.String(), parsedMessage.Body)
-			if err != nil {
-				errorHandle(socket, "atol-webserver: ", "Error while sending POST: ", err.Error())
-				return
-			}
-			defer postResp.Body.Close()
-			writeToLog("atol-webserver: ", "POST response status: ", postResp.Status)
+			// checking Shift state, close if expired
 
-			if postResp.StatusCode == http.StatusCreated {
-				writeToLog("self: ", "3. GETting result... ")
-				//here we need to loop this several times until task isnt finished
+			writeToLog("self: ", "1. Checking shift state ")
 
-				for i := 0; i < getRequestAttempts; i++ {
-					getResp, err := http.Get(fmt.Sprintf("%s/%s", atolServerURL, newUUID.String()))
-					if err != nil {
-						writeToLog("atol-webserver: ", "Error while sending GET: ", err)
-					}
+			device.SetParam(fptr10.LIBFPTR_PARAM_DATA_TYPE, fptr10.LIBFPTR_DT_SHIFT_STATE)
+			device.QueryData()
 
-					defer getResp.Body.Close()
-					if getResp.StatusCode == http.StatusOK {
+			shiftState := device.GetParamInt(fptr10.LIBFPTR_PARAM_SHIFT_STATE)
 
-						getRespBody, _ := ioutil.ReadAll(getResp.Body)
-						writeToLog("atol-webserver: ", "GET response Body:", string(getRespBody))
+			if shiftState == fptr10.LIBFPTR_SS_EXPIRED {
+				writeToLog("self: ", "1.1 Closing expired Shift")
+				device.SetParam(fptr10.LIBFPTR_PARAM_REPORT_TYPE, fptr10.LIBFPTR_RT_CLOSE_SHIFT)
 
-						var getRespBodyStruct getRespType
-						err = json.Unmarshal(getRespBody, &getRespBodyStruct)
-						if err != nil {
-							writeToLog("self: ", "Error while GET response JSON unmarshaling: ", err)
-						}
-						result := getRespBodyStruct.Results[0]
-
-						if result.Status == "ready" {
-							writeToLog("atol-webserver: ", "Everything seems to be OK")
-							successJSON, _ := json.Marshal(map[string]string{"type": "success", "message": "We've reached 'ready' status"})
-							socket.SendText(string(successJSON))
-							break
-						} else {
-							writeToLog("atol-webserver: ", "Task wasn't printed. Status: ", result.Status, ". Error code: ", result.ErrorCode, ". Error description: ", result.ErrorDescription)
-						}
-					} else {
-						writeToLog("atol-webserver: ", "Failed GET request: ", getResp.Status)
-					}
-					time.Sleep(getRequestDelay * time.Second)
+				if err = device.Report(); err != nil {
+					errorHandle(socket, "self: ", "Error while shift closing: ", err.Error())
+					device.Close()
+					return
 				}
-			} else {
-				errorHandle(socket, "atol-webserver: ", "Failed POST request", "Task from POST request wasn't added to queue")
+
+				if err = device.CheckDocumentClosed(); err != nil {
+					errorHandle(socket, "self: ", "Error while document closing check: ", err.Error())
+					device.Close()
+					return
+				}
 			}
+
+			writeToLog("self: ", "2. Try to open receipt")
+
+			var side int
+			switch task.Side {
+			case Debit:
+				side = fptr10.LIBFPTR_RT_BUY
+			case Credit:
+				side = fptr10.LIBFPTR_RT_SELL
+			default:
+				errorHandle(socket, "self: ", "Error while receipt type defining: ", "wrong receipt type param")
+				device.Close()
+				return
+			}
+
+			device.SetParam(fptr10.LIBFPTR_PARAM_RECEIPT_TYPE, side)
+
+			if err = device.OpenReceipt(); err != nil {
+				errorHandle(socket, "self: ", "Error while receipt opening: ", err.Error())
+				device.Close()
+				return
+			}
+
+			writeToLog("self: ", "Receipt has been opened successfully. ")
+			writeToLog("self: ", "3. Try to register receipt ")
+
+			device.SetParam(fptr10.LIBFPTR_PARAM_COMMODITY_NAME, product.Name)
+			device.SetParam(fptr10.LIBFPTR_PARAM_PRICE, product.Price)
+			device.SetParam(fptr10.LIBFPTR_PARAM_QUANTITY, product.Quantity)
+			device.SetParam(fptr10.LIBFPTR_PARAM_TAX_TYPE, fptr10.LIBFPTR_TAX_NO)
+			device.SetParam(1212, 4) // unnamed param responsible for the print line "service" or "product"
+
+			if err = device.Registration(); err != nil {
+				errorHandle(socket, "self: ", "Error while receipt registration: ", err.Error())
+				device.Close()
+				return
+			}
+
+			writeToLog("self: ", "Receipt has been registered successfully ")
+			writeToLog("self: ", "4. Try to handle payments")
+
+			for i := 0; i < len(payments); i++ {
+				var paymentType int
+				switch payments[i].Type {
+				case "cash":
+					paymentType = fptr10.LIBFPTR_PT_CASH
+				case "electronically":
+					paymentType = fptr10.LIBFPTR_PT_ELECTRONICALLY
+				default:
+					errorHandle(socket, "self: ", "Error while payment type defining: ", "invalid payment type param")
+					device.Close()
+					return
+				}
+				device.SetParam(fptr10.LIBFPTR_PARAM_PAYMENT_TYPE, paymentType)
+				device.SetParam(fptr10.LIBFPTR_PARAM_PAYMENT_SUM, payments[i].Sum)
+				if err = device.Payment(); err != nil {
+					errorHandle(socket, "self: ", "Error while payment handling: ", err.Error())
+					device.Close()
+					return
+				}
+			}
+			writeToLog("self: ", "Payments have been added")
+			writeToLog("self: ", "5. Try to close receipt")
+
+			device.CloseReceipt()
+
+			if err = device.CheckDocumentClosed(); err != nil {
+				errorHandle(socket, "self: ", "Error while document closing check: ", err.Error())
+				device.Close()
+				return
+			}
+
+			if !device.GetParamBool(fptr10.LIBFPTR_PARAM_DOCUMENT_CLOSED) {
+				device.CancelReceipt()
+				errorHandle(socket, "self: ", "Document wasn't closed. Receipt has been canceled: ", device.ErrorDescription())
+				device.Close()
+				return
+			}
+
+			if !device.GetParamBool(fptr10.LIBFPTR_PARAM_DOCUMENT_PRINTED) {
+				errorHandle(socket, "self: ", "Error while print retry: ", device.ErrorDescription())
+				device.Close()
+				return
+			}
+
+			if err := device.Close(); err != nil {
+				log.Println(err)
+				return
+			}
+
+			writeToLog("self: ", "Everything seems to be OK")
+
+			successJSON, _ := json.Marshal(map[string]string{"type": "success", "message": "We've reached 'ready' status"})
+			socket.SendText(string(successJSON))
+
 			writeToLog("self: ", " ======= Task finished ======== ")
 
-		default:
-			writeToLog("self: ", "Unknown message type")
 		}
-
 	}
 
-	socket.OnPingReceived = func(data string, socket gowebsocket.Socket) {
-		socket.SendText("heartbeat")
-	}
-
-	socket.OnDisconnected = func(err error, socket gowebsocket.Socket) {
-		writeToLog("wsserver: ", "Disconnected from server")
-		return
-	}
 	for !connected {
 		socket.Connect()
 		time.Sleep(time.Second)
@@ -196,15 +407,12 @@ func (p *program) run() {
 		}
 	}
 }
-func (p *program) Stop(s service.Service) error {
-	return nil
-}
 
 func main() {
 	svcConfig := &service.Config{
-		Name:        "AtolPrintService",
+		Name:        "AtolPrintUtility",
 		DisplayName: "ATOL print service",
-		Description: "Service for communication between atol web-server and remote nodejs application",
+		Description: "Service for communication between atol device and remote nodejs application",
 	}
 
 	prg := &program{}
@@ -220,119 +428,6 @@ func main() {
 	if err != nil {
 		logger.Error(err)
 	}
-}
-
-func handleShiftStatus() error {
-
-	newUUID, err := uuid.NewUUID()
-	if err != nil {
-		return fmt.Errorf("Error while uuid generation: %s", err.Error())
-	}
-	var r = struct {
-		Type string `json:"type"`
-	}{"getShiftStatus"}
-	postResp, err := postRequest(newUUID.String(), r)
-	if err != nil {
-		return fmt.Errorf("Error while sending POST: %s", err.Error())
-	}
-	defer postResp.Body.Close()
-
-	if postResp.StatusCode == http.StatusCreated {
-		for i := 0; i < getRequestAttempts; i++ {
-			getResp, err := http.Get(fmt.Sprintf("%s/%s", atolServerURL, newUUID.String()))
-			if err != nil {
-				return fmt.Errorf("Error while sending GET: %s", err.Error())
-			}
-			defer getResp.Body.Close()
-
-			if getResp.StatusCode == http.StatusOK {
-				getRespBody, _ := ioutil.ReadAll(getResp.Body)
-
-				var getRespBodyStruct getShiftRespType
-				err = json.Unmarshal(getRespBody, &getRespBodyStruct)
-				if err != nil {
-					return fmt.Errorf("Error while GET response JSON unmarshaling: %s", err.Error())
-				}
-
-				response := getRespBodyStruct.Results[0]
-
-				if response.Status == "ready" {
-					writeToLog("atol-webserver: ", " Shift State: ", response.Result.ShiftStatus.State)
-					if response.Result.ShiftStatus.State == "opened" {
-						writeToLog("atol-webserver: ", " Shift is opened. Proceed to main procedure")
-						return nil
-					}
-					// if Shift is expired - we need to close it
-					if response.Result.ShiftStatus.State == "expired" {
-						writeToLog("atol-webserver: ", " Shift was expired. Trying to close it...")
-						newUUID2, err := uuid.NewUUID()
-						if err != nil {
-							return fmt.Errorf("Error while uuid generation: %s", err.Error())
-						}
-						var r = struct {
-							Type string `json:"type"`
-						}{"closeShift"}
-						postResp, err := postRequest(newUUID2.String(), r)
-						if err != nil {
-							return fmt.Errorf("Error while sending POST: %s", err.Error())
-						}
-						defer postResp.Body.Close()
-
-						if postResp.StatusCode == http.StatusCreated {
-							for i := 0; i < getRequestAttempts; i++ {
-								getResp, err := http.Get(fmt.Sprintf("%s/%s", atolServerURL, newUUID2.String()))
-								if err != nil {
-									return fmt.Errorf("Error while sending GET: %s", err.Error())
-								}
-								defer getResp.Body.Close()
-
-								if getResp.StatusCode == http.StatusOK {
-									getRespBody, _ := ioutil.ReadAll(getResp.Body)
-									var getRespBodyStruct getRespType
-									err = json.Unmarshal(getRespBody, &getRespBodyStruct)
-									if err != nil {
-										return fmt.Errorf("Error while GET response JSON unmarshaling: %s", err.Error())
-									}
-									response := getRespBodyStruct.Results[0]
-									if response.Status == "ready" {
-										writeToLog("atol-webserver: ", "Shift has been closed and should be opened automatically.")
-										return nil
-									}
-									time.Sleep(getRequestDelay * time.Second)
-								}
-							}
-							return fmt.Errorf("Closing shift task failed. All attempts are timed out")
-						}
-						return fmt.Errorf("Task from POST request wasn't added to queue: %s", postResp.Status)
-					}
-				} else {
-					time.Sleep(getRequestDelay * time.Second)
-				}
-			} else {
-				return fmt.Errorf("GET result of getShitStatus failed")
-			}
-		}
-		return fmt.Errorf("Get shift status task failed. All attempts are timed out")
-	}
-	return fmt.Errorf("POST getShitStatus task wasn't added to queue: %s", postResp.Status)
-}
-
-func postRequest(newUUID string, request interface{}) (*http.Response, error) {
-
-	postReqBody := map[string]interface{}{"uuid": newUUID, "request": request}
-	postJSON, err := json.Marshal(postReqBody)
-	if err != nil {
-		return nil, fmt.Errorf("Error while JSON marshaling: %s", err.Error())
-	}
-	req, err := http.NewRequest("POST", atolServerURL, bytes.NewBuffer(postJSON))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	postResp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Error while sending POST: %s", err.Error())
-	}
-	return postResp, nil
 }
 
 func writeToLog(prefix string, a ...interface{}) {
@@ -351,4 +446,73 @@ func errorHandle(socket gowebsocket.Socket, level, title, body string) {
 	writeToLog(level, title, body)
 	errJSON, _ := json.Marshal(map[string]string{"type": "error", "message": fmt.Sprintf("%s | %s", title, body)})
 	socket.SendText(string(errJSON))
+}
+
+func connectDevice(port string) (*fptr10.IFptr, error) {
+
+	fptr := fptr10.New()
+
+	if fptr == nil {
+		return fptr, errors.New("Cannot load driver")
+	}
+
+	settings := fmt.Sprintf("{ \"%v\": %d, \"%v\": %d, \"%v\": %s, \"%v\": %d }",
+		fptr10.LIBFPTR_SETTING_MODEL, fptr10.LIBFPTR_MODEL_ATOL_AUTO,
+		fptr10.LIBFPTR_SETTING_PORT, fptr10.LIBFPTR_PORT_COM,
+		fptr10.LIBFPTR_SETTING_COM_FILE, port,
+		fptr10.LIBFPTR_SETTING_BAUDRATE, fptr10.LIBFPTR_PORT_BR_115200)
+	fptr.SetSettings(settings)
+
+	for i := 1; i < CONNECTION_ATTEMPTS; i++ {
+		fptr.Open()
+		isOpened := fptr.IsOpened()
+		if isOpened {
+			return fptr, nil
+		}
+		time.Sleep(time.Duration(math.Pow(2, float64(i))) * time.Millisecond)
+	}
+	return fptr, fmt.Errorf("Cannot open connection for device on port %v", port)
+}
+
+func definePorts() (string, string) {
+	fptr := fptr10.New()
+
+	if fptr == nil {
+		log.Fatal(errors.New("Cannot load driver"))
+	}
+
+	var pawnshopPort, leasingPort string
+
+	for i := 1; i <= 9; i++ {
+		var ii = strconv.Itoa(i)
+		settings := fmt.Sprintf("{ \"%v\": %d, \"%v\": %d, \"%v\": %s, \"%v\": %d }",
+			fptr10.LIBFPTR_SETTING_MODEL, fptr10.LIBFPTR_MODEL_ATOL_AUTO,
+			fptr10.LIBFPTR_SETTING_PORT, fptr10.LIBFPTR_PORT_COM,
+			fptr10.LIBFPTR_SETTING_COM_FILE, ii,
+			fptr10.LIBFPTR_SETTING_BAUDRATE, fptr10.LIBFPTR_PORT_BR_115200)
+		fptr.SetSettings(settings)
+
+		if err := fptr.Open(); err != nil {
+			writeToLog("self: ", "REJECTED COM-FILE: ", i)
+			continue
+		} else {
+			fptr.SetParam(fptr10.LIBFPTR_PARAM_DATA_TYPE, fptr10.LIBFPTR_DT_SERIAL_NUMBER)
+			fptr.QueryData()
+			serialNumber := fptr.GetParamString(fptr10.LIBFPTR_PARAM_SERIAL_NUMBER)
+			writeToLog("self: ", "S/N: ", serialNumber, " COM-FILE: ", ii)
+			if serialNumber == PAWNSHOP_SERIAL {
+				pawnshopPort = ii
+				fptr.Close()
+				continue
+			} else if serialNumber == LEASING_SERIAL {
+				leasingPort = ii
+				fptr.Close()
+				continue
+			} else {
+				writeToLog("self: ", "Unknown device with serial number: ", serialNumber)
+				log.Fatal(errors.New("Unknown device"))
+			}
+		}
+	}
+	return pawnshopPort, leasingPort
 }

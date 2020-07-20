@@ -26,10 +26,16 @@ var logger service.Logger
 type program struct{}
 
 type Side string
+type Method string
+type Subject string
 
 const (
-	Credit Side = "debit"
-	Debit  Side = "credit"
+	Credit  Side = "debit"
+	Debit   Side = "credit"
+	Prepaid Method = "prepaid"
+	Full    Method = "full"
+	Service Subject = "service"
+	Deposit Subject = "deposit"
 )
 
 type incomingMessage struct {
@@ -39,6 +45,8 @@ type incomingMessage struct {
 	Body      struct {
 		Operator string
 		Side     Side
+		Method   Method
+		Subject   Subject
 		Product  struct {
 			Name     string
 			Price    int32
@@ -240,7 +248,6 @@ func (p *program) run() {
 			writeToLog("self: ", " ======= New task ======= ")
 			// define what device we should looking for and establish its connection
 			var port string
-			// TODO: how to get rid of hardcoded port numbers
 			switch parsedMessage.Device {
 			case "pawnshop":
 				port = pawnshopPort
@@ -308,6 +315,37 @@ func (p *program) run() {
 				return
 			}
 
+			var method int
+			switch task.Method {
+			case Full:
+				method = 4
+			case Prepaid:
+				method = 3
+			default:
+				errorHandle(socket, "self: ", "Error while payment method defining: ", "wrong payment method param")
+				device.Close()
+				return
+			}
+			var subject int
+			switch task.Subject {
+			case Service:
+				subject = 4
+			case Deposit:
+				subject = 19
+			default:
+				errorHandle(socket, "self: ", "Error while payment subject defining: ", "wrong payment subject param")
+				device.Close()
+				return
+			}
+
+			writeToLog("device and method: ", parsedMessage.Device, task.Method)
+
+			if parsedMessage.Device == "leasing" && task.Method == "full" {
+				device.SetParam(fptr10.LIBFPTR_PARAM_SETTING_ID, 58)
+				device.SetParam(fptr10.LIBFPTR_PARAM_SETTING_VALUE, 0)
+				device.WriteDeviceSetting()
+			}
+
 			device.SetParam(fptr10.LIBFPTR_PARAM_RECEIPT_TYPE, side)
 
 			if err = device.OpenReceipt(); err != nil {
@@ -323,7 +361,8 @@ func (p *program) run() {
 			device.SetParam(fptr10.LIBFPTR_PARAM_PRICE, product.Price)
 			device.SetParam(fptr10.LIBFPTR_PARAM_QUANTITY, product.Quantity)
 			device.SetParam(fptr10.LIBFPTR_PARAM_TAX_TYPE, fptr10.LIBFPTR_TAX_NO)
-			device.SetParam(1212, 4) // unnamed param responsible for the print line "service" or "product"
+			device.SetParam(1212, subject) // unnamed param responsible for the print line "service" or "deposit"
+			device.SetParam(1214, method) // paramd responsible for the print line "full payments" or "prepaid"
 
 			if err = device.Registration(); err != nil {
 				errorHandle(socket, "self: ", "Error while receipt registration: ", err.Error())
@@ -355,6 +394,7 @@ func (p *program) run() {
 				}
 			}
 			writeToLog("self: ", "Payments have been added")
+
 			writeToLog("self: ", "5. Try to close receipt")
 
 			device.CloseReceipt()
@@ -381,6 +421,12 @@ func (p *program) run() {
 			if err := device.Close(); err != nil {
 				log.Println(err)
 				return
+			}
+
+			if parsedMessage.Device == "leasing" && task.Method == "full" {
+				device.SetParam(fptr10.LIBFPTR_PARAM_SETTING_ID, 58)
+				device.SetParam(fptr10.LIBFPTR_PARAM_SETTING_VALUE, 1)
+				device.WriteDeviceSetting()
 			}
 
 			writeToLog("self: ", "Everything seems to be OK")
